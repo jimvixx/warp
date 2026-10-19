@@ -229,6 +229,21 @@ define_settings_group!(InputSettings,
             surface: settings::SettingSurfaces::GUI,
             private: true,
         },
+        // Master "Smart layout-aware shortcuts" toggle. When enabled, the
+        // matcher treats single-letter / single-digit Logical bindings as if
+        // they were Physical bindings on the equivalent W3C UIEvents code -
+        // so `Cmd+C` / `Ctrl+C` for copy works on any keyboard layout (RU,
+        // DE, AR, ...) without the user having to rebind every shortcut.
+        smart_layout_aware_bindings: SmartLayoutAwareBindings {
+            type: bool,
+            default: false,
+            supported_platforms: SupportedPlatforms::DESKTOP,
+            sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+            surface: settings::SettingSurfaces::GUI,
+            private: false,
+            toml_path: "keyboard.smart_layout_aware_bindings",
+            description: "Match single-letter and single-digit shortcuts by physical key, so they work on any keyboard layout (e.g. Cmd+C copies on a Russian layout). Symbol shortcuts like Cmd+/ are unaffected.",
+        },
     ]
 );
 

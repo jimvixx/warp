@@ -424,6 +424,7 @@ impl TestStep {
                     keystroke,
                     details: KeyEventDetails::default(),
                     is_composing: false,
+                    physical_code: None,
                 }));
         }
         self
@@ -445,6 +446,7 @@ impl TestStep {
                     keystroke,
                     details: KeyEventDetails::default(),
                     is_composing: true,
+                    physical_code: None,
                 }));
         }
         self

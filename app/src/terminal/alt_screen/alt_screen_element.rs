@@ -854,6 +854,7 @@ impl Element for AltScreenElement {
                 chars,
                 details,
                 is_composing,
+                ..
             } => {
                 if !self.is_terminal_focused
                     || (*is_composing && !handle_keystroke_despite_composing(keystroke))

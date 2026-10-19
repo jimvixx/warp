@@ -4606,6 +4606,7 @@ impl Element for BlockListElement {
                 chars,
                 details,
                 is_composing,
+                ..
             } => {
                 // If this isn't the currently focused session, it shouldn't receive the keydown
                 // event.

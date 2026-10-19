@@ -116,6 +116,7 @@ pub unsafe fn from_native(
                     chars,
                     details,
                     is_composing: false,
+                    physical_code: None,
                 })
             }
             NSEventType::MouseMoved => window_height.map(|window_height| Event::MouseMoved {

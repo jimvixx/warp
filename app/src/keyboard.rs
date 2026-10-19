@@ -10,6 +10,20 @@ use warpui::keymap::Keystroke;
 #[cfg(not(test))]
 use warpui::keymap::Trigger;
 
+use crate::settings::InputSettings;
+use settings::Setting as _;
+use warpui::SingletonEntity as _;
+
+/// Push the current `InputSettings::smart_layout_aware_bindings` value into
+/// the keystroke matcher. Call this at startup (after `load_custom_keybindings`)
+/// and whenever the setting changes via the UI - the matcher caches the flag
+/// to avoid re-reading settings on every keypress.
+pub fn sync_smart_binding_to_matcher(app: &mut AppContext) {
+    let enabled = *InputSettings::as_ref(app)
+        .smart_layout_aware_bindings
+        .value();
+    app.set_smart_binding_enabled(enabled);
+}
 /// Environment variable to disable saving keybindings to file (used in integration tests)
 pub const DISABLE_SAVE_ENV_VAR: &str = "WARP_TEST_DISABLE_KEYBINDING_SAVE";
 const REMOVED_KEYBINDING_SERIALIZATION: &str = "none";

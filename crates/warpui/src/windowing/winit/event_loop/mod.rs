@@ -2052,6 +2052,7 @@ impl EventLoop {
                     chars: String::new(),
                     details: crate::event::KeyEventDetails::default(),
                     is_composing: false,
+                    physical_code: None,
                 });
             }
             SoftKeyboardInput::KeyboardDismissed => {
@@ -2079,6 +2080,7 @@ impl EventLoop {
                     chars,
                     details: crate::event::KeyEventDetails::default(),
                     is_composing: false,
+                    physical_code: None,
                 });
             }
         }
