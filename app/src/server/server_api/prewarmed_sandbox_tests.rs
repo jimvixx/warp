@@ -15,6 +15,96 @@ const CONFIGURATION_JSON: &str = include_str!(
     "../../../../crates/graphql/src/api/mutations/fixtures/prewarmed_sandbox_config.json"
 );
 
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn control_unavailable_recognizes_native_handshake_410() {
+    for status in [410, 403, 503] {
+        let response = websocket::tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .unwrap();
+        let error = anyhow::Error::new(websocket::tungstenite::Error::Http(response))
+            .context("control handshake failed");
+        assert_eq!(is_prewarmed_sandbox_unavailable(&error), status == 410);
+    }
+}
+
+#[test]
+fn control_unavailable_recognizes_an_http_410() {
+    for status in [410, 403, 503] {
+        let error = anyhow::Error::new(HttpStatusError::new(status, String::new()))
+            .context("workload token request failed");
+        assert_eq!(is_prewarmed_sandbox_unavailable(&error), status == 410);
+    }
+}
+
+#[test]
+fn control_socket_url_uses_websocket_schemes_and_binds_the_generation() {
+    for (http_url, expected) in [
+        (
+            "https://app.warp.dev/internal/prewarmed-sandboxes/sb/ws",
+            "wss://app.warp.dev/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+        (
+            "http://localhost:8080/internal/prewarmed-sandboxes/sb/ws",
+            "ws://localhost:8080/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+    ] {
+        assert_eq!(control_socket_url(http_url, "abc123").unwrap(), expected);
+    }
+    assert!(control_socket_url("ftp://app.warp.dev/ws", "abc123").is_err());
+}
+
+#[test]
+#[serial_test::serial]
+fn control_origin_override_leaves_status_on_the_server_root() {
+    let server_root = ChannelState::server_root_url();
+    assert_eq!(
+        control_socket_url(&ServerApi::prewarmed_sandbox_url("sb", "ws"), "abc123").unwrap(),
+        control_socket_url(
+            &format!("{server_root}/internal/prewarmed-sandboxes/sb/ws"),
+            "abc123"
+        )
+        .unwrap()
+    );
+    for (origin, expected) in [
+        (
+            "https://platform.warp.dev",
+            "wss://platform.warp.dev/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+        (
+            "http://localhost:8082",
+            "ws://localhost:8082/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+    ] {
+        ChannelState::override_prewarmed_sandbox_control_url(origin).unwrap();
+        assert_eq!(
+            control_socket_url(&ServerApi::prewarmed_sandbox_url("sb", "ws"), "abc123").unwrap(),
+            expected
+        );
+        assert_eq!(
+            ServerApi::prewarmed_sandbox_url("sb", "status"),
+            format!("{server_root}/internal/prewarmed-sandboxes/sb/status")
+        );
+        assert_eq!(ChannelState::server_root_url(), server_root);
+    }
+    ChannelState::set(ChannelState::init());
+}
+
+#[test]
+#[cfg(not(target_family = "wasm"))]
+fn native_control_headers_are_sensitive() {
+    let request =
+        control_request("ws://localhost/control", "access-marker", "workload-marker").unwrap();
+    for name in ["authorization", PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER] {
+        assert!(request.headers()[name].is_sensitive());
+    }
+    for debug in [format!("{request:?}"), format!("{request:#?}")] {
+        assert!(!debug.contains("access-marker"));
+        assert!(!debug.contains("workload-marker"));
+    }
+}
+
 fn wire_configuration() -> GraphqlConfiguration {
     let response: cynic::GraphQlResponse<PrewarmedSandboxConfig> =
         serde_json::from_str(CONFIGURATION_JSON).unwrap();
@@ -95,6 +185,12 @@ fn deserializes_a_server_configuration() {
     assert_eq!(config.preparation.skills, ["warpdotdev/warp:review"]);
     assert_eq!(config.preparation.factory_skill_dirs, [".agents/skills"]);
     assert!(config.preparation.computer_use_enabled);
+    let providers = config.preparation.providers.as_ref().unwrap();
+    assert_eq!(providers.gcp.as_ref().unwrap().project_number, "123456789");
+    assert_eq!(
+        providers.aws.as_ref().unwrap().role_arn,
+        "arn:aws:iam::123456789012:role/OzAgent"
+    );
 
     assert_eq!(
         config.environment_variables.get("WARP_FACTORY_REPO_DIR"),
@@ -327,6 +423,65 @@ fn ready_status_sends_the_fingerprint_as_the_manifest_hash() {
 }
 
 #[test]
+fn heartbeat_is_the_only_sandbox_message() {
+    assert_eq!(
+        serde_json::to_value(PrewarmedSandboxControlRequest::Heartbeat {
+            generation: "abc123"
+        })
+        .unwrap(),
+        serde_json::json!({ "type": "heartbeat", "generation": "abc123" })
+    );
+}
+
+#[test]
+fn decodes_retirement_with_and_without_a_reason() {
+    for (message, expected) in [
+        (
+            r#"{"type":"retired","reason":"unavailable"}"#,
+            Some("unavailable"),
+        ),
+        (r#"{"type":"retired"}"#, None),
+    ] {
+        let event: PrewarmedSandboxControlEvent = serde_json::from_str(message).unwrap();
+        let PrewarmedSandboxControlEvent::Retired { reason } = event else {
+            panic!("expected retirement");
+        };
+        assert_eq!(reason.as_deref(), expected);
+    }
+}
+
+/// A server can add message types without breaking a sandbox that is already waiting.
+#[test]
+fn decodes_messages_this_client_does_not_know_as_unknown() {
+    for message in [
+        r#"{"type":"offer"}"#,
+        r#"{"type":"configuration_updated","generation":"def456"}"#,
+    ] {
+        let event: PrewarmedSandboxControlEvent = serde_json::from_str(message).unwrap();
+        assert!(matches!(event, PrewarmedSandboxControlEvent::Unknown));
+    }
+}
+
+/// The server pings an idle socket, and a ping must not end the connection.
+#[test]
+fn control_reader_skips_non_text_frames() {
+    let mut reader = PrewarmedSandboxControlReader {
+        stream: Box::pin(futures::stream::iter([
+            Ok::<_, websocket::Error>(websocket::Message::new_binary(vec![0])),
+            Ok(websocket::Message::new_text(
+                r#"{"type":"retired","reason":"unavailable"}"#.into(),
+            )),
+        ])),
+    };
+    let Some(PrewarmedSandboxControlEvent::Retired { reason }) =
+        futures::executor::block_on(reader.next()).unwrap()
+    else {
+        panic!("expected retirement");
+    };
+    assert_eq!(reason.as_deref(), Some("unavailable"));
+}
+
+#[test]
 fn bounds_a_stalled_request() {
     let error = futures::executor::block_on(bounded_request(
         Duration::ZERO,
@@ -349,6 +504,72 @@ fn request_deadline_preserves_completed_results() {
     }))
     .unwrap_err();
     assert_eq!(error.to_string(), "credential failure");
+}
+
+#[test]
+fn fresh_assignment_fixture_decodes_nullable_control_fields() {
+    let fixture = include_str!("testdata/prewarmed_assignment_fresh_run.json");
+    let event: PrewarmedSandboxControlEvent = serde_json::from_str(fixture).unwrap();
+    let PrewarmedSandboxControlEvent::Assignment {
+        generation,
+        execution_config,
+        runtime_env,
+        api_key,
+        expires_at,
+    } = event
+    else {
+        panic!("expected assignment event");
+    };
+    assert_eq!(generation, "generation-abc");
+    assert_eq!(
+        execution_config.task_id.inner(),
+        "550e8400-e29b-41d4-a716-446655440000"
+    );
+    assert_eq!(execution_config.execution_id.inner(), "42");
+    assert_eq!(runtime_env["WARP_SANDBOX_DEADLINE"], "1767225600");
+    assert!(execution_config.conversation_id.is_none());
+    assert!(execution_config.repositories[0].ref_.is_none());
+    assert!(
+        execution_config
+            .inference_providers
+            .as_ref()
+            .unwrap()
+            .aws_bedrock
+            .as_ref()
+            .unwrap()
+            .region
+            .is_none()
+    );
+    assert_eq!(api_key, "wk-placeholder-not-a-real-key");
+    assert_eq!(expires_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+}
+
+#[test]
+fn assignment_debug_omits_run_credentials_and_embedded_config_values() {
+    let mut event: PrewarmedSandboxControlEvent =
+        serde_json::from_str(include_str!("testdata/prewarmed_assignment_fresh_run.json")).unwrap();
+    if let PrewarmedSandboxControlEvent::Assignment {
+        api_key,
+        runtime_env,
+        execution_config,
+        ..
+    } = &mut event
+    {
+        *api_key = "assignment-key-marker".into();
+        runtime_env.insert("SECRET".into(), "assignment-env-marker".into());
+        execution_config.mcp_servers_json = "assignment-mcp-marker".into();
+        execution_config.setup_commands = vec!["assignment-setup-marker".into()];
+    }
+    for debug in [format!("{event:?}"), format!("{event:#?}")] {
+        for marker in [
+            "assignment-key-marker",
+            "assignment-env-marker",
+            "assignment-mcp-marker",
+            "assignment-setup-marker",
+        ] {
+            assert!(!debug.contains(marker));
+        }
+    }
 }
 
 #[cfg(not(feature = "skip_login"))]
@@ -408,16 +629,6 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
         })))
         .with_status(204)
         .create();
-    let heartbeat = server
-        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/heartbeat")
-        .match_header("authorization", "Bearer test-access-token")
-        .match_header(
-            PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER,
-            "test-workload-token",
-        )
-        .match_body(Matcher::Json(serde_json::json!({"fingerprint": "abc123"})))
-        .with_status(204)
-        .create();
     drop(server);
     block_on(async {
         assert_eq!(
@@ -427,11 +638,9 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
         api.report_status("sandbox", "abc123", PrewarmedSandboxState::Ready)
             .await
             .unwrap();
-        api.heartbeat("sandbox", "abc123").await.unwrap();
     });
     config.assert();
     status.assert();
-    heartbeat.assert();
 }
 
 #[test]
@@ -449,7 +658,7 @@ fn request_debug_redacts_both_credentials() {
     }));
     let mut server = ChannelState::mock_server();
     let request = server
-        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/heartbeat")
+        .mock("POST", "/internal/prewarmed-sandboxes/sandbox/status")
         .match_header("authorization", "Bearer test-access-token")
         .match_header(
             PREWARMED_SANDBOX_WORKLOAD_TOKEN_HEADER,
@@ -459,7 +668,7 @@ fn request_debug_redacts_both_credentials() {
         .expect(1)
         .create();
     drop(server);
-    let url = ServerApi::prewarmed_sandbox_url("sandbox", "heartbeat");
+    let url = ServerApi::prewarmed_sandbox_url("sandbox", "status");
 
     block_on(async {
         let response = api
@@ -480,7 +689,8 @@ fn rejects_requests_without_access_credentials() {
     let api = ServerApi::new_for_test();
     api.base_client
         .set_ambient_workload_token_for_test("test-workload-token".to_string(), None);
-    let error = block_on(api.heartbeat("sandbox", "abc123")).unwrap_err();
+    let error =
+        block_on(api.report_status("sandbox", "abc123", PrewarmedSandboxState::Ready)).unwrap_err();
     assert!(
         error.to_string().contains("requires an access token"),
         "{error:#}"

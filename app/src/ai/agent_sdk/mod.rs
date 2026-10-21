@@ -2,6 +2,7 @@
 //! For now this provides a simple runner that echoes the received command.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt::Write;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ use warp_logging::log_file_path;
 use warp_managed_secrets::{ManagedSecretValue, convert_task_secrets};
 use warp_server_client::iap::{IapManager, IapManagerEvent};
 use warpui::platform::TerminationMode;
-use warpui::{AppContext, ModelSpawner, SingletonEntity};
+use warpui::{AppContext, Entity, ModelSpawner, SingletonEntity};
 
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::api::convert_conversation::{
@@ -159,6 +160,39 @@ fn bedrock_oidc_credentials_config(
         role_arn,
         region,
     })
+}
+
+/// Switches the run to OIDC-federated AWS credentials for a Bedrock inference role and waits
+/// for the first set to be minted, recording the config on `options` for later refreshes.
+#[cfg(not(target_family = "wasm"))]
+async fn configure_bedrock_oidc_credentials<E: Entity>(
+    foreground: &ModelSpawner<E>,
+    options: &mut AgentDriverOptions,
+    role_arn: String,
+    region: String,
+) -> Result<(), AgentDriverError> {
+    let config = bedrock_oidc_credentials_config(options, role_arn, region)?;
+    let request_scope = options
+        .team_scope
+        .as_ref()
+        .map(RequestTeamScope::from_scope);
+    options.bedrock_oidc_credentials = Some(config.clone());
+    // Set the OIDC strategy on the UI thread and kick off the refresh; the
+    // returned future resolves when credentials are committed to the model.
+    foreground
+        .spawn(move |_, ctx| {
+            ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                // From here on, refresh credentials via OIDC federation only.
+                manager.set_aws_credentials_refresh_strategy(
+                    AwsCredentialsRefreshStrategy::OidcManaged,
+                    ctx,
+                );
+                refresh_aws_credentials_oidc(config, request_scope, manager, ctx)
+            })
+        })
+        .await?
+        .await
+        .map_err(AgentDriverError::AwsBedrockCredentialsFailed)
 }
 
 pub(crate) fn run_environment_checkout(
@@ -581,10 +615,15 @@ fn build_server_side_task(
     Ok((config, task))
 }
 
-fn factory_repository_contract(task_id: Option<AmbientAgentTaskId>, enabled: bool) -> bool {
-    task_id.is_some()
-        && enabled
-        && std::env::var_os("WARP_FACTORY_ID").is_some_and(|id| !id.is_empty())
+/// Names the variable whose non-empty value marks a Factory run.
+const FACTORY_ID_ENV: &str = "WARP_FACTORY_ID";
+
+fn factory_repository_contract(
+    task_id: Option<AmbientAgentTaskId>,
+    enabled: bool,
+    factory_id: Option<impl AsRef<OsStr>>,
+) -> bool {
+    task_id.is_some() && enabled && factory_id.is_some_and(|id| !id.as_ref().is_empty())
 }
 
 #[derive(Clone, Copy)]
@@ -594,7 +633,7 @@ struct RepositoryContract {
 }
 
 fn build_execution_task_and_options(
-    args: &RunAgentArgs,
+    args: Option<&RunAgentArgs>,
     config: ExecutionConfiguration,
     repository_contract: RepositoryContract,
     working_dir: PathBuf,
@@ -611,24 +650,33 @@ fn build_execution_task_and_options(
         supports_deferred_repositories,
         use_factory_repositories,
     } = repository_contract;
-    let task_id = args
-        .task_id
-        .as_deref()
-        .context("Execution configuration requires a task ID")?
-        .parse::<AmbientAgentTaskId>()
-        .context("Invalid execution task ID")?;
+    let task_id = match args {
+        Some(args) => args
+            .task_id
+            .as_deref()
+            .context("Execution configuration requires a task ID")?,
+        None => config.task_id.inner(),
+    }
+    .parse::<AmbientAgentTaskId>()
+    .context("Invalid execution task ID")?;
     anyhow::ensure!(
         config.task_id.inner() == task_id.to_string(),
         "Execution configuration task mismatch"
     );
-    let execution_id = args
-        .execution_id
-        .as_deref()
-        .context("Execution configuration requires an execution ID")?;
+    let execution_id = match args {
+        Some(args) => args
+            .execution_id
+            .as_deref()
+            .context("Execution configuration requires an execution ID")?,
+        None => config.execution_id.inner(),
+    };
     anyhow::ensure!(
         !execution_id.is_empty() && config.execution_id.inner() == execution_id,
         "Execution configuration execution mismatch"
     );
+    let harness_transport = args
+        .and_then(|args| args.harness_transport)
+        .unwrap_or_default();
     let selected_harness = execution_config::harness(&config.harness)?;
     let model = if selected_harness == Harness::Oz {
         config
@@ -673,7 +721,7 @@ fn build_execution_task_and_options(
         model,
         profile: config.profile_id.map(|id| id.into_inner()),
         mcp_specs,
-        harness: harness_kind(selected_harness, args.harness_transport.unwrap_or_default())?,
+        harness: harness_kind(selected_harness, harness_transport)?,
     };
     let options = AgentDriverOptions {
         working_dir: working_dir.clone(),
@@ -710,17 +758,23 @@ fn build_execution_task_and_options(
             )
         }),
         selected_harness,
-        harness_transport: args.harness_transport.unwrap_or_default(),
+        harness_transport,
         third_party_harness_model_config,
         team_scope: None,
         bedrock_oidc_credentials: None,
         snapshot_disabled: Some(config.snapshot_disabled),
-        snapshot_upload_timeout: args.snapshot.snapshot_upload_timeout.map(Into::into),
-        snapshot_script_timeout: args.snapshot.snapshot_script_timeout.map(Into::into),
+        snapshot_upload_timeout: args
+            .and_then(|args| args.snapshot.snapshot_upload_timeout)
+            .map(Into::into),
+        snapshot_script_timeout: args
+            .and_then(|args| args.snapshot.snapshot_script_timeout)
+            .map(Into::into),
         checkpoint_interval: None,
         skip_initial_turn: config.skip_initial_turn,
-        strict_mcp_startup: args.strict_mcp_startup,
-        mcp_startup_timeout: args.mcp_startup_timeout.map(Into::into),
+        strict_mcp_startup: args.is_some_and(|args| args.strict_mcp_startup),
+        mcp_startup_timeout: args
+            .and_then(|args| args.mcp_startup_timeout)
+            .map(Into::into),
     };
     Ok((
         options,
@@ -975,31 +1029,13 @@ impl AgentDriverRunner {
                             .to_string(),
                     )
                 })?;
-                let config =
-                    bedrock_oidc_credentials_config(&driver_options, role_arn, role_region)?;
-                let request_scope = driver_options
-                    .team_scope
-                    .as_ref()
-                    .map(RequestTeamScope::from_scope);
-                driver_options.bedrock_oidc_credentials = Some(config.clone());
-                // Set the OIDC strategy on the UI thread and kick off the refresh; the
-                // returned future resolves when credentials are committed to the model.
-                let refresh_future = foreground
-                    .spawn(move |_, ctx| {
-                        ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
-                            // From here on, refresh credentials via OIDC federation only.
-                            manager.set_aws_credentials_refresh_strategy(
-                                AwsCredentialsRefreshStrategy::OidcManaged,
-                                ctx,
-                            );
-                            refresh_aws_credentials_oidc(config, request_scope, manager, ctx)
-                        })
-                    })
-                    .await?;
-
-                refresh_future
-                    .await
-                    .map_err(AgentDriverError::AwsBedrockCredentialsFailed)?;
+                configure_bedrock_oidc_credentials(
+                    &foreground,
+                    &mut driver_options,
+                    role_arn,
+                    role_region,
+                )
+                .await?;
             }
 
             match &task.harness {
@@ -1062,8 +1098,8 @@ impl AgentDriverRunner {
         result
     }
 
-    async fn refresh_team_metadata(
-        foreground: &ModelSpawner<Self>,
+    async fn refresh_team_metadata<E: Entity>(
+        foreground: &ModelSpawner<E>,
         cloud_startup: bool,
     ) -> Result<(), AgentDriverError> {
         foreground
@@ -1093,8 +1129,8 @@ impl AgentDriverRunner {
             .map_err(AgentDriverError::TeamMetadataRefreshFailed)
     }
 
-    async fn set_ambient_agent_task_id(
-        foreground: &ModelSpawner<Self>,
+    async fn set_ambient_agent_task_id<E: Entity>(
+        foreground: &ModelSpawner<E>,
         task_id: Option<AmbientAgentTaskId>,
     ) -> Result<(), AgentDriverError> {
         #[cfg(feature = "crash_reporting")]
@@ -1118,8 +1154,11 @@ impl AgentDriverRunner {
         execution_id: &str,
     ) -> Result<ExecutionTaskData, AgentDriverError> {
         let supports_deferred_repositories = FeatureFlag::FactoryDeferredRepositories.is_enabled();
-        let use_factory_repositories =
-            factory_repository_contract(task_id.parse().ok(), supports_deferred_repositories);
+        let use_factory_repositories = factory_repository_contract(
+            task_id.parse().ok(),
+            supports_deferred_repositories,
+            std::env::var_os(FACTORY_ID_ENV),
+        );
         let (workload_token, no_isolation) =
             match warp_isolation_platform::issue_workload_token(Some(Duration::from_mins(5))).await
             {
@@ -1214,17 +1253,17 @@ impl AgentDriverRunner {
         .await
     }
 
-    async fn bootstrap_git_credentials_for_task(
-        foreground: &ModelSpawner<Self>,
+    async fn bootstrap_git_credentials_for_task<E: Entity>(
+        foreground: &ModelSpawner<E>,
         task_id_str: &str,
-        args: &RunAgentArgs,
+        configure_git_credentials_with_github: bool,
         use_factory_repositories: bool,
     ) -> Result<(), AgentDriverError> {
         // The gh CLI only covers github.com, so this must not replace the
         // server fetch below — other forges (GitLab, Azure DevOps) get their
         // credentials exclusively from the server.
-        let git_credentials_configured_with_gh = warp_isolation_platform::detect().is_none()
-            && args.configure_git_credentials_with_github;
+        let git_credentials_configured_with_gh =
+            warp_isolation_platform::detect().is_none() && configure_git_credentials_with_github;
         if git_credentials_configured_with_gh {
             foreground
                 .spawn(|_, _| {
@@ -1378,13 +1417,14 @@ impl AgentDriverRunner {
                 factory_repository_contract(
                     args.task_id.as_deref().and_then(|id| id.parse().ok()),
                     FeatureFlag::FactoryDeferredRepositories.is_enabled(),
+                    std::env::var_os(FACTORY_ID_ENV),
                 )
             });
         if let Some(task_id_str) = args.task_id.as_ref() {
             Self::bootstrap_git_credentials_for_task(
                 foreground,
                 task_id_str,
-                &args,
+                args.configure_git_credentials_with_github,
                 use_factory_repositories,
             )
             .await?;
@@ -1418,7 +1458,7 @@ impl AgentDriverRunner {
             let (mut options, mut task, conversation_id, providers) = foreground
                 .spawn(move |_, ctx| {
                     build_execution_task_and_options(
-                        &args,
+                        Some(&args),
                         config,
                         repository_contract,
                         working_dir,
@@ -1448,14 +1488,9 @@ impl AgentDriverRunner {
                 )
                 .await?;
             if FeatureFlag::OzIdentityFederation.is_enabled() {
-                options.cloud_providers = driver::cloud_provider::load_providers(
-                    &providers,
-                    &options
-                        .task_id
-                        .ok_or(AgentDriverError::InvalidRuntimeState)?
-                        .to_string(),
-                )
-                .map_err(AgentDriverError::CloudProviderSetupFailed)?;
+                options.cloud_providers =
+                    driver::cloud_provider::load_providers(&providers, Some(&task_id.to_string()))
+                        .map_err(AgentDriverError::CloudProviderSetupFailed)?;
             }
             return Ok((options, task, conversation_id));
         }
@@ -2051,12 +2086,9 @@ impl AgentDriverRunner {
             .await??;
 
         if FeatureFlag::OzIdentityFederation.is_enabled() {
-            let run_id = driver_options
-                .task_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "local".to_string());
+            let run_id = driver_options.task_id.map(|id| id.to_string());
             driver_options.cloud_providers =
-                driver::cloud_provider::load_providers(&environment.providers, &run_id)
+                driver::cloud_provider::load_providers(&environment.providers, run_id.as_deref())
                     .map_err(AgentDriverError::CloudProviderSetupFailed)?;
         }
 

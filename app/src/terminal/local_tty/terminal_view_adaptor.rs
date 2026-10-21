@@ -2235,6 +2235,13 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
     ) -> bool {
         TerminalManager::recover_cloud_shell(self, request, ctx)
     }
+    fn replace_shell(
+        &mut self,
+        request: crate::terminal::shell_recovery::ShellReplacementRequest,
+        ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+    ) -> anyhow::Result<()> {
+        TerminalManager::replace_shell(self, request, ctx)
+    }
 
     fn on_session_bootstrapped(
         &mut self,

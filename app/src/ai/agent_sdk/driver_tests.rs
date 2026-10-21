@@ -1027,7 +1027,7 @@ fn metadata_secret_collision_rejects_even_an_empty_injected_value() {
         ManagedSecretValue::raw_value("managed-value"),
     )]);
 
-    let result = build_secret_env_vars(&secrets);
+    let result = build_secret_env_vars(&secrets, &HashMap::new());
 
     unsafe {
         match previous {
@@ -1049,7 +1049,7 @@ fn raw_value_only_writes_under_secret_name() {
         "MY_SECRET".to_string(),
         ManagedSecretValue::raw_value("s3cret"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("MY_SECRET")),
         Some(&OsString::from("s3cret"))
@@ -1066,7 +1066,7 @@ fn anthropic_api_key_writes_anthropic_env_var() {
         "my-custom-name".to_string(),
         ManagedSecretValue::anthropic_api_key("sk-ant-test-key"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("ANTHROPIC_API_KEY")),
         Some(&OsString::from("sk-ant-test-key"))
@@ -1092,7 +1092,7 @@ fn typed_secret_overrides_raw_value_with_same_env_name() {
     ]);
     // Run multiple times to defeat HashMap iteration order flakiness.
     for _ in 0..20 {
-        let env_vars = build_secret_env_vars(&secrets).unwrap();
+        let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
         assert_eq!(
             env_vars.get(&OsString::from("ANTHROPIC_API_KEY")),
             Some(&OsString::from(typed_key)),
@@ -1120,7 +1120,7 @@ fn bedrock_api_key_writes_all_bedrock_env_vars() {
             ManagedSecretValue::raw_value("eu-west-1"),
         ),
     ]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("AWS_BEARER_TOKEN_BEDROCK")),
         Some(&OsString::from("token-123"))
@@ -1158,7 +1158,7 @@ fn bedrock_access_key_writes_all_aws_env_vars() {
             "ap-southeast-1",
         ),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("AWS_ACCESS_KEY_ID")),
         Some(&OsString::from("AKID"))
@@ -1190,7 +1190,7 @@ fn raw_value_skipped_when_process_env_already_set() {
         "WORKER_TOKEN".to_string(),
         ManagedSecretValue::raw_value("managed-value"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     // The worker-injected env var wins; env_vars should NOT contain it
     // because the child inherits the process env directly.
     assert!(!env_vars.contains_key(&OsString::from("WORKER_TOKEN")));
@@ -1207,7 +1207,7 @@ fn worker_injected_env_wins_over_typed_secret() {
         "my-auth".to_string(),
         ManagedSecretValue::anthropic_api_key("managed-key"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     // The typed secret should be skipped entirely; the child inherits
     // ANTHROPIC_API_KEY from the process env.
     assert!(!env_vars.contains_key(&OsString::from("ANTHROPIC_API_KEY")));
@@ -1230,7 +1230,7 @@ fn worker_injected_env_skips_entire_bedrock_secret() {
         "bedrock-secret".to_string(),
         ManagedSecretValue::anthropic_bedrock_api_key("token-456", "eu-central-1"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert!(
         !env_vars.contains_key(&OsString::from("AWS_BEARER_TOKEN_BEDROCK")),
         "Entire Bedrock secret must be skipped when any field is worker-injected"
@@ -1248,7 +1248,7 @@ fn docker_registry_secret_never_injected_as_env_var() {
         "my-registry".to_string(),
         ManagedSecretValue::docker_registry("us-docker.pkg.dev", "_json_key", "s3cret-pass"),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert!(
         env_vars.is_empty(),
         "a registry credential authenticates an image pull, not the agent process, and must \
@@ -2801,7 +2801,12 @@ fn deferred_repository_semantic_skill_publication_without_initial_inventory() {
                     }
                     let driver = app.update(|ctx| AgentDriver::create(options, ctx).unwrap());
                     let foreground = driver.update(&mut app, |driver, ctx| {
-                        assert!(driver.workspace.take().unwrap().source_repos.is_empty());
+                        let Some(super::WorkspaceState::Pending(workspace)) =
+                            driver.workspace.take()
+                        else {
+                            panic!("expected a workspace awaiting setup");
+                        };
+                        assert!(workspace.source_repos.is_empty());
                         assert_eq!(driver.factory_repository_contract, should_activate);
                         assert_eq!(
                             driver.resolved_env_vars.contains_key(std::ffi::OsStr::new(
@@ -3037,7 +3042,7 @@ fn openai_api_key_exports_only_api_key_not_base_url() {
             Some("https://us.api.openai.com/v1".to_string()),
         ),
     )]);
-    let env_vars = build_secret_env_vars(&secrets).unwrap();
+    let env_vars = build_secret_env_vars(&secrets, &HashMap::new()).unwrap();
     assert_eq!(
         env_vars.get(&OsString::from("OPENAI_API_KEY")),
         Some(&OsString::from("sk-test-key")),

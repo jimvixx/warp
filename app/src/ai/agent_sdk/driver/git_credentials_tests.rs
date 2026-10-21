@@ -1,3 +1,6 @@
+use std::io::Write as _;
+use std::process::Stdio;
+
 use warp_graphql::ai::PlatformErrorCode;
 use warp_graphql::error::{
     PlatformError as GraphqlPlatformError, UserFacingError, UserFacingErrorInterface,
@@ -10,6 +13,79 @@ use warp_graphql::response_context::ResponseContext;
 
 use super::*;
 use crate::server::server_api::ai::{MockAIClient, TaskGitCredentialsResponse};
+
+#[test]
+fn git_authentication_preserves_managed_credentials() -> Result<()> {
+    let Some(home) = std::env::var_os("WARP_TEST_MANAGED_CREDENTIALS_HOME") else {
+        let home = tempfile::tempdir()?;
+        let mut command = BlockingCommand::new(std::env::current_exe()?);
+        #[cfg(windows)]
+        command.creation_flags(0);
+        let output = command
+            .args([
+                "--exact",
+                "ai::agent_sdk::driver::git_credentials::tests::git_authentication_preserves_managed_credentials",
+                "--nocapture",
+            ])
+            .current_dir(home.path())
+            .env("WARP_TEST_MANAGED_CREDENTIALS_HOME", home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    };
+
+    let path = PathBuf::from(home).join(".git-credentials");
+    let credentials = "https://oauth2:gitlab-token@gitlab.com\n";
+    std::fs::write(&path, credentials)?;
+    setup_git_config(&[]);
+
+    let credential_command = |operation: &str, input: &str| -> Result<String> {
+        let mut child = BlockingCommand::new("git")
+            .args(["credential", operation])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(input.as_bytes())?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    credential_command(
+        "reject",
+        "protocol=https\nhost=gitlab.com\nusername=oauth2\npassword=gitlab-token\n\n",
+    )?;
+    let filled = credential_command("fill", "protocol=https\nhost=gitlab.com\n\n")?;
+    assert!(filled.lines().any(|line| line == "username=oauth2"));
+    assert!(filled.lines().any(|line| line == "password=gitlab-token"));
+
+    credential_command(
+        "approve",
+        "protocol=https\nhost=gitlab.com\nusername=oauth2\npassword=other-token\n\n",
+    )?;
+    assert_eq!(std::fs::read_to_string(path)?, credentials);
+    Ok(())
+}
 
 #[test]
 fn refresh_keeps_the_captured_repository_scope() {

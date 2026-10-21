@@ -102,7 +102,7 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
             .unwrap();
             let (options, _, _, _) = app.update(|ctx| {
                 super::build_execution_task_and_options(
-                    &args,
+                    Some(&args),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories,
@@ -173,6 +173,36 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
 }
 
 #[test]
+fn factory_repositories_need_a_task_support_and_a_factory_id() {
+    let task_id = || TASK_ID.parse().ok();
+    assert!(super::factory_repository_contract(
+        task_id(),
+        true,
+        Some("factory")
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        true,
+        Some("")
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        true,
+        None::<&str>
+    ));
+    assert!(!super::factory_repository_contract(
+        task_id(),
+        false,
+        Some("factory")
+    ));
+    assert!(!super::factory_repository_contract(
+        None,
+        true,
+        Some("factory")
+    ));
+}
+
+#[test]
 fn paired_execution_rejects_a_different_task_or_execution() {
     App::test((), |mut app| async move {
         let root = tempfile::TempDir::new().unwrap();
@@ -196,7 +226,7 @@ fn paired_execution_rejects_a_different_task_or_execution() {
             .unwrap();
             let result = app.update(|ctx| {
                 super::build_execution_task_and_options(
-                    &args,
+                    Some(&args),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories: true,

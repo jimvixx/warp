@@ -1276,7 +1276,7 @@ fn configured_and_profile_mcp_servers_wait_for_environment_setup() {
             let terminal_driver =
                 TerminalDriver::create_from_existing_view(driver_terminal_view, ctx);
             let mut driver = AgentDriver::new_for_test(std::env::temp_dir(), terminal_driver, ctx);
-            driver.workspace = Some(
+            driver.workspace = Some(crate::ai::agent_sdk::driver::WorkspaceState::Pending(
                 WorkspaceConfiguration::from_legacy(
                     Some(&AmbientAgentEnvironment::new(
                         "test".to_string(),
@@ -1290,7 +1290,7 @@ fn configured_and_profile_mcp_servers_wait_for_environment_setup() {
                     false,
                 )
                 .unwrap(),
-            );
+            ));
             driver.mcp_startup_timeout = Duration::from_secs(5);
             driver
         });
