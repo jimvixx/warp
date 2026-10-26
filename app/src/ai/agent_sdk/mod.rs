@@ -632,8 +632,10 @@ struct RepositoryContract {
     use_factory_repositories: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_execution_task_and_options(
     args: Option<&RunAgentArgs>,
+    harness_transport: HarnessTransport,
     config: ExecutionConfiguration,
     repository_contract: RepositoryContract,
     working_dir: PathBuf,
@@ -674,9 +676,6 @@ fn build_execution_task_and_options(
         !execution_id.is_empty() && config.execution_id.inner() == execution_id,
         "Execution configuration execution mismatch"
     );
-    let harness_transport = args
-        .and_then(|args| args.harness_transport)
-        .unwrap_or_default();
     let selected_harness = execution_config::harness(&config.harness)?;
     let model = if selected_harness == Harness::Oz {
         config
@@ -1459,6 +1458,7 @@ impl AgentDriverRunner {
                 .spawn(move |_, ctx| {
                     build_execution_task_and_options(
                         Some(&args),
+                        args.harness_transport.unwrap_or_default(),
                         config,
                         repository_contract,
                         working_dir,
@@ -1989,8 +1989,8 @@ impl AgentDriverRunner {
     /// [`driver::ResumeOptions::ThirdParty`]; each harness owns its server call and error
     /// mapping. Returns `None` if a third-party harness has no resume payload to surface.
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true, conversation_id = conversation_id))]
-    async fn load_conversation_information(
-        foreground: &ModelSpawner<Self>,
+    async fn load_conversation_information<E: Entity>(
+        foreground: &ModelSpawner<E>,
         conversation_id: String,
         harness: &HarnessKind,
     ) -> Result<Option<driver::ResumeOptions>, AgentDriverError> {
